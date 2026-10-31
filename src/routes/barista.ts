@@ -1,15 +1,27 @@
 import { Router } from "express";
 import { z } from "zod";
 import type { Server as SocketServer } from "socket.io";
+import mongoose from "mongoose";
 import { BaristaShift, toBaristaShiftDto } from "../models/BaristaShift.js";
+import { User } from "../models/User.js";
 import { BaristaCall, toBaristaCallDto } from "../models/BaristaCall.js";
-import { requireAuth, type AuthedRequest } from "../middleware/auth.js";
+import { requireAuth, requireRoles, type AuthedRequest } from "../middleware/auth.js";
 import { asyncHandler } from "../lib/async-handler.js";
 import { sendWebPush } from "../lib/web-push.js";
 
-async function listShifts() {
+/** Only active Barista accounts count — admins/managers are never "on duty". */
+export async function listShifts() {
   const docs = await BaristaShift.find().sort({ updatedAtIso: -1 }).lean();
-  return docs.map((doc) =>
+  const ids = docs
+    .map((doc) => doc.baristaId)
+    .filter((id) => mongoose.isValidObjectId(id));
+  const baristas = await User.find({ _id: { $in: ids }, role: "Barista", active: true })
+    .select("_id")
+    .lean();
+  const baristaIds = new Set(baristas.map((user) => String(user._id)));
+  return docs
+    .filter((doc) => baristaIds.has(doc.baristaId))
+    .map((doc) =>
     toBaristaShiftDto({
       ...doc,
       _id: doc._id,
@@ -50,23 +62,14 @@ export function createBaristaRouter(io: SocketServer) {
     });
   }));
 
-  router.post("/clock-in", asyncHandler(async (req, res) => {
-    const parsed = z
-      .object({
-        baristaId: z.string().trim().min(1),
-        baristaName: z.string().trim().min(1),
-      })
-      .safeParse(req.body);
-    if (!parsed.success) {
-      res.status(400).json({ error: "Invalid clock-in payload" });
-      return;
-    }
+  router.post("/clock-in", requireAuth, requireRoles("Barista"), asyncHandler(async (req: AuthedRequest, res) => {
+    const baristaId = String(req.user!._id);
     const stamp = new Date().toISOString();
     const doc = await BaristaShift.findOneAndUpdate(
-      { baristaId: parsed.data.baristaId },
+      { baristaId },
       {
-        baristaId: parsed.data.baristaId,
-        baristaName: parsed.data.baristaName,
+        baristaId,
+        baristaName: req.user!.name,
         status: "clocked_in",
         clockedInAt: stamp,
         clockedOutAt: undefined,
@@ -85,22 +88,31 @@ export function createBaristaRouter(io: SocketServer) {
     res.json({ shift, available, anyOnDuty: true });
   }));
 
-  router.post("/clock-out", asyncHandler(async (req, res) => {
+  router.post("/clock-out", requireAuth, asyncHandler(async (req: AuthedRequest, res) => {
     const parsed = z
       .object({
-        baristaId: z.string().trim().min(1),
+        baristaId: z.string().trim().min(1).optional(),
       })
-      .safeParse(req.body);
+      .safeParse(req.body ?? {});
     if (!parsed.success) {
       res.status(400).json({ error: "Invalid clock-out payload" });
       return;
     }
-    const existing = await BaristaShift.findOne({ baristaId: parsed.data.baristaId });
+    const selfId = String(req.user!._id);
+    const baristaId = parsed.data.baristaId || selfId;
+    const canClockOutOthers = ["Administrator", "Manager", "Branch Manager", "Supervisor"].includes(
+      req.user!.role,
+    );
+    if (baristaId !== selfId && !canClockOutOthers) {
+      res.status(403).json({ error: "Forbidden" });
+      return;
+    }
+    const existing = await BaristaShift.findOne({ baristaId });
     const stamp = new Date().toISOString();
     const doc = await BaristaShift.findOneAndUpdate(
-      { baristaId: parsed.data.baristaId },
+      { baristaId },
       {
-        baristaId: parsed.data.baristaId,
+        baristaId,
         baristaName: existing?.baristaName || "Barista",
         status: "clocked_out",
         clockedInAt: existing?.clockedInAt,

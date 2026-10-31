@@ -4,6 +4,20 @@ import type { Server as SocketServer } from "socket.io";
 import { ModuleRecord } from "../models/ModuleRecord.js";
 import { requireAuth, type AuthedRequest } from "../middleware/auth.js";
 import { asyncHandler } from "../lib/async-handler.js";
+import { listShifts } from "./barista.js";
+
+/** Duty board lives in BaristaShift (barista-only); never serve or store a client copy. */
+const BARISTA_AVAILABILITY_KEY = "barista_availability";
+
+async function baristaAvailabilityRows() {
+  const shifts = await listShifts();
+  return shifts.map((shift, position) => ({
+    recordId: shift.id,
+    data: shift,
+    position,
+    updatedAt: shift.updatedAt,
+  }));
+}
 
 export function createModuleRecordsRouter(io: SocketServer) {
   const router = Router();
@@ -12,6 +26,11 @@ export function createModuleRecordsRouter(io: SocketServer) {
     const moduleKey = String(req.params.key || "").trim();
     if (!moduleKey) {
       res.status(400).json({ error: "Module key is required" });
+      return;
+    }
+
+    if (moduleKey === BARISTA_AVAILABILITY_KEY) {
+      res.json({ moduleKey, records: await baristaAvailabilityRows() });
       return;
     }
 
@@ -50,6 +69,12 @@ export function createModuleRecordsRouter(io: SocketServer) {
     const parsed = upsertSchema.safeParse(req.body);
     if (!parsed.success) {
       res.status(400).json({ error: "Invalid module records payload" });
+      return;
+    }
+
+    if (moduleKey === BARISTA_AVAILABILITY_KEY) {
+      // Clock-in/out go through /api/barista; ignore client copies (they resurrected stale shifts).
+      res.json({ ok: true, moduleKey, records: await baristaAvailabilityRows() });
       return;
     }
 
